@@ -1,0 +1,57 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: local_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull nomic-embed-text && ollama pull llama3.1 && echo 'Modelos baixados com sucesso!' && wait"]
+    restart: unless-stopped
+
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: local_redis_vector
+    ports:
+      - "6379:6379"
+      - "8001:8001"
+    restart: unless-stopped
+
+  mcp-server:
+    build: ./mcp-server
+    container_name: local_mcp_server
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    container_name: langchain_api
+    ports:
+      - "8000:8000"
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - .:/app
+    working_dir: /app/api
+    depends_on:
+      - ollama
+      - redis
+      - mcp-server
+    restart: unless-stopped
+
+  rag-dashboard:
+    build: ./dashboard
+    container_name: local_rag_dashboard
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  ollama_data:

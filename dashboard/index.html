@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="pt-BR" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Control Center - RTX 5070</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        darkbg: '#0f172a',
+                        cardbg: '#1e293b',
+                    }
+                }
+            }
+        }
+    </script>
+    <!-- Alpine.js para reatividade simples e leve -->
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body class="bg-darkbg text-slate-100 font-sans antialiased min-h-screen flex flex-col">
+
+    <!-- Header -->
+    <header class="border-b border-slate-800 bg-cardbg/50 backdrop-blur sticky top-0 z-50 px-6 py-4 flex justify-between items-center">
+        <div class="flex items-center space-x-3">
+            <span class="inline-block w-3 h-3 bg-emerald-500 rounded-full animate-pulse"></span>
+            <h1 class="text-lg font-bold tracking-tight">RAG Guardrails & MCP Dashboard</h1>
+        </div>
+        <div class="text-xs text-slate-400 bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-700">
+            Stack: FastAPI + Ollama (RTX 5070) + Redis
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="flex-1 max-w-7xl w-full mx-auto p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+        <!-- Coluna da Esquerda: Chat & Consulta RAG (2 colunas) -->
+        <section class="lg:col-span-2 flex flex-col bg-cardbg rounded-xl border border-slate-800 shadow-xl overflow-hidden"
+                 x-data="ragChat()">
+
+            <div class="p-4 border-b border-slate-800 bg-slate-900/50 flex justify-between items-center">
+                <h2 class="font-semibold text-sm text-slate-300">Terminal de Consulta LLM</h2>
+                <button @click="limparChat()" class="text-xs text-slate-400 hover:text-white transition">Limpar Histórico</button>
+            </div>
+
+            <!-- Caixa de Mensagens -->
+            <div class="flex-1 p-4 overflow-y-auto space-y-4 max-h-[500px] min-h-[350px]" id="chat-container">
+                <template x-for="msg in mensagens" :key="msg.id">
+                    <div :class="msg.role === 'user' ? 'flex justify-end' : 'flex justify-start'">
+                        <div :class="msg.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-slate-800 border border-slate-700 text-slate-200'"
+                             class="max-w-xl rounded-xl px-4 py-3 text-sm shadow-md space-y-1">
+                            <div class="flex justify-between items-center text-xs opacity-70 space-x-4">
+                                <span class="font-semibold" x-text="msg.role === 'user' ? 'Você' : 'RAG / Llama 3.1'"></span>
+                                <span x-text="msg.source ? `Origem: ${msg.source} (${msg.tempo}s)` : ''"></span>
+                            </div>
+                            <p class="whitespace-pre-wrap" x-text="msg.text"></p>
+                        </div>
+                    </div>
+                </template>
+                <div x-show="loading" class="flex justify-start">
+                    <div class="bg-slate-800 border border-slate-700 text-slate-400 rounded-xl px-4 py-3 text-sm animate-pulse flex items-center space-x-2">
+                        <svg class="animate-spin h-4 w-4 text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        <span>Processando na GPU RTX 5070 / Verificando Cache...</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Input de Envio -->
+            <form @submit.prevent="enviarPergunta()" class="p-4 border-t border-slate-800 bg-slate-900/50 flex gap-3">
+                <input type="text" x-model="pergunta" placeholder="Digite sua pergunta técnica (ex: status da CPU, Docker)..."
+                       class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-4 py-2.5 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 transition">
+                <button type="submit" :disabled="loading"
+                        class="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-5 py-2.5 rounded-lg text-sm font-semibold transition flex items-center shadow-lg shadow-indigo-600/20">
+                    Enviar
+                </button>
+            </form>
+        </section>
+
+        <!-- Coluna da Direita: Métricas do Laboratório (1 coluna) -->
+        <section class="flex flex-col space-y-6" x-data="metricsData()" x-init="initPolling()">
+            <div class="bg-cardbg rounded-xl border border-slate-800 shadow-xl p-5 space-y-4">
+                <div class="flex justify-between items-center border-b border-slate-800 pb-3">
+                    <h2 class="font-semibold text-sm text-slate-300">Métricas de Cache & LLM</h2>
+                    <button @click="fetchMetrics()" class="text-xs text-indigo-400 hover:underline">Atualizar</button>
+                </div>
+
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="bg-slate-900/60 border border-slate-800 p-3 rounded-lg text-center">
+                        <span class="block text-xs text-slate-400">Chamadas LLM</span>
+                        <span class="text-xl font-bold text-indigo-400" x-text="metrics.resumo_geral.consultas_processadas_llm">0</span>
+                    </div>
+                    <div class="bg-slate-900/60 border border-slate-800 p-3 rounded-lg text-center">
+                        <span class="block text-xs text-slate-400">Hits Cache</span>
+                        <span class="text-xl font-bold text-emerald-400" x-text="metrics.resumo_geral.consultas_reaproveitadas_cache">0</span>
+                    </div>
+                </div>
+
+                <div class="space-y-2 pt-2 text-xs text-slate-300">
+                    <div class="flex justify-between bg-slate-900/40 px-3 py-2 rounded">
+                        <span class="text-slate-400">Total de Registros:</span>
+                        <span class="font-medium" x-text="metrics.resumo_geral.total_registros_laboratorio">0</span>
+                    </div>
+                    <div class="flex justify-between bg-slate-900/40 px-3 py-2 rounded">
+                        <span class="text-slate-400">Tempo Médio:</span>
+                        <span class="font-medium" x-text="metrics.resumo_geral.tempo_medio_execucao_segundos + 's'">0s</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Card de Ações Rápidas -->
+            <div class="bg-cardbg rounded-xl border border-slate-800 shadow-xl p-5 space-y-3">
+                <h2 class="font-semibold text-sm text-slate-300">Ações do Sistema</h2>
+                <button @click="reindexarBase()"
+                        class="w-full bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 py-2 rounded-lg text-xs font-semibold transition">
+                    🔄 Reindexar Base (Docs .md)
+                </button>
+                <p class="text-[11px] text-slate-500 text-center">Recarrega as regras e escopos no Redis Vector Store.</p>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Script de Lógica Frontend -->
+    <script>
+        function ragChat() {
+            return {
+                pergunta: '',
+                loading: false,
+                mensagens: [
+                    { id: 1, role: 'assistant', text: 'Olá! Sou o assistente de infraestrutura protegido por Guardrails. Como posso ajudar?', source: null, tempo: null }
+                ],
+                scrollToBottom() {
+                    this.$nextTick(() => {
+                        const container = document.getElementById('chat-container');
+                        if (container) {
+                            container.scrollTop = container.scrollHeight;
+                        }
+                    });
+                },
+                async enviarPergunta() {
+                    if (!this.pergunta.trim()) return;
+
+                    const q = this.pergunta;
+                    this.mensagens.push({ id: Date.now(), role: 'user', text: q });
+                    this.pergunta = '';
+                    this.loading = true;
+                    this.scrollToBottom();
+
+                    try {
+                        const response = await fetch('http://localhost:8000/perguntar', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ question: q })
+                        });
+                        const data = await response.json();
+
+                        this.mensagens.push({
+                            id: Date.now() + 1,
+                            role: 'assistant',
+                            text: data.answer || JSON.stringify(data),
+                            source: data.source,
+                            tempo: data.execution_time_seconds
+                        });
+                    } catch (err) {
+                        this.mensagens.push({
+                            id: Date.now() + 1,
+                            role: 'assistant',
+                            text: 'Erro de conexão com a API FastAPI.',
+                            source: 'error',
+                            tempo: 0
+                        });
+                    } finally {
+                        this.loading = false;
+                        this.scrollToBottom();
+                    }
+                },
+                limparChat() {
+                    this.mensagens = [{ id: 1, role: 'assistant', text: 'Histórico limpo. Como posso ajudar?', source: null, tempo: null }];
+                    this.scrollToBottom();
+                }
+            }
+        }
+
+        function metricsData() {
+            return {
+                metrics: {
+                    resumo_geral: { total_registros_laboratorio: 0, consultas_processadas_llm: 0, consultas_reaproveitadas_cache: 0, tempo_medio_execucao_segundos: 0 }
+                },
+                async fetchMetrics() {
+                    try {
+                        const res = await fetch('http://localhost:8000/metricas-laboratorio');
+                        const data = await res.json();
+                        this.metrics = data;
+                    } catch (e) {
+                        console.error('Erro ao buscar métricas', e);
+                    }
+                },
+                async reindexarBase() {
+                    try {
+                        await fetch('http://localhost:8000/reindexar', { method: 'POST' });
+                        alert('Base reindexada com sucesso!');
+                        this.fetchMetrics();
+                    } catch (e) {
+                        alert('Erro ao reindexar base.');
+                    }
+                },
+                initPolling() {
+                    this.fetchMetrics();
+                    setInterval(() => this.fetchMetrics(), 5000); // Atualiza as métricas a cada 5 segundos
+                }
+            }
+        }
+    </script>
+</body>
+</html>
