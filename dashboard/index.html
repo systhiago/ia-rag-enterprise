@@ -31,30 +31,30 @@
             <h1 class="text-lg font-bold tracking-tight">RAG Guardrails & MCP Dashboard</h1>
         </div>
         <div class="text-xs text-slate-400 bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-700">
-            Stack: FastAPI + Ollama (RTX 5070) + Redis
+            Stack: FastAPI + Ollama (RTX 5070) + Redis + MCP
         </div>
     </header>
 
     <!-- Main Container -->
     <main class="flex-1 max-w-7xl w-full mx-auto p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
 
-        <!-- Coluna da Esquerda: Chat & Consulta RAG (2 colunas) -->
-        <section class="lg:col-span-2 flex flex-col bg-cardbg rounded-xl border border-slate-800 shadow-xl overflow-hidden"
+        <!-- Coluna da Esquerda: Chat & Consulta RAG (2 colunas) com altura fixa e input na base -->
+        <section class="lg:col-span-2 flex flex-col bg-cardbg rounded-xl border border-slate-800 shadow-xl overflow-hidden h-[750px]"
                  x-data="ragChat()">
 
-            <div class="p-4 border-b border-slate-800 bg-slate-900/50 flex justify-between items-center">
-                <h2 class="font-semibold text-sm text-slate-300">Terminal de Consulta LLM</h2>
+            <div class="p-4 border-b border-slate-800 bg-slate-900/50 flex justify-between items-center shrink-0">
+                <h2 class="font-semibold text-sm text-slate-300">Terminal de Consulta LLM & MCP</h2>
                 <button @click="limparChat()" class="text-xs text-slate-400 hover:text-white transition">Limpar Histórico</button>
             </div>
 
             <!-- Caixa de Mensagens -->
-            <div class="flex-1 p-4 overflow-y-auto space-y-4 max-h-[500px] min-h-[350px]" id="chat-container">
+            <div class="flex-1 p-4 overflow-y-auto space-y-4" id="chat-container">
                 <template x-for="msg in mensagens" :key="msg.id">
                     <div :class="msg.role === 'user' ? 'flex justify-end' : 'flex justify-start'">
                         <div :class="msg.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-slate-800 border border-slate-700 text-slate-200'"
                              class="max-w-xl rounded-xl px-4 py-3 text-sm shadow-md space-y-1">
                             <div class="flex justify-between items-center text-xs opacity-70 space-x-4">
-                                <span class="font-semibold" x-text="msg.role === 'user' ? 'Você' : 'RAG / Llama 3.1'"></span>
+                                <span class="font-semibold" x-text="msg.role === 'user' ? 'Você' : 'RAG / MCP / Llama 3.1'"></span>
                                 <span x-text="msg.source ? `Origem: ${msg.source} (${msg.tempo}s)` : ''"></span>
                             </div>
                             <p class="whitespace-pre-wrap" x-text="msg.text"></p>
@@ -67,14 +67,14 @@
                             <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                             <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                         </svg>
-                        <span>Processando na GPU RTX 5070 / Verificando Cache...</span>
+                        <span>Processando na GPU RTX 5070 / Verificando Cache & MCP...</span>
                     </div>
                 </div>
             </div>
 
-            <!-- Input de Envio -->
-            <form @submit.prevent="enviarPergunta()" class="p-4 border-t border-slate-800 bg-slate-900/50 flex gap-3">
-                <input type="text" x-model="pergunta" placeholder="Digite sua pergunta técnica (ex: status da CPU, Docker)..."
+            <!-- Input de Envio Fixo na Base -->
+            <form @submit.prevent="enviarPergunta()" class="p-4 border-t border-slate-800 bg-slate-900/50 flex gap-3 shrink-0">
+                <input type="text" x-model="pergunta" placeholder="Digite sua pergunta técnica (ex: status da CPU, Docker, MCP)..."
                        class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-4 py-2.5 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 transition">
                 <button type="submit" :disabled="loading"
                         class="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-5 py-2.5 rounded-lg text-sm font-semibold transition flex items-center shadow-lg shadow-indigo-600/20">
@@ -87,18 +87,23 @@
         <section class="flex flex-col space-y-6" x-data="metricsData()" x-init="initPolling()">
             <div class="bg-cardbg rounded-xl border border-slate-800 shadow-xl p-5 space-y-4">
                 <div class="flex justify-between items-center border-b border-slate-800 pb-3">
-                    <h2 class="font-semibold text-sm text-slate-300">Métricas de Cache & LLM</h2>
+                    <h2 class="font-semibold text-sm text-slate-300">Métricas & Telemetria</h2>
                     <button @click="fetchMetrics()" class="text-xs text-indigo-400 hover:underline">Atualizar</button>
                 </div>
 
-                <div class="grid grid-cols-2 gap-3">
-                    <div class="bg-slate-900/60 border border-slate-800 p-3 rounded-lg text-center">
-                        <span class="block text-xs text-slate-400">Chamadas LLM</span>
-                        <span class="text-xl font-bold text-indigo-400" x-text="metrics.resumo_geral.consultas_processadas_llm">0</span>
+                <!-- Grid com 3 colunas para LLM, Cache e MCP -->
+                <div class="grid grid-cols-3 gap-2">
+                    <div class="bg-slate-900/60 border border-slate-800 p-2.5 rounded-lg text-center">
+                        <span class="block text-[11px] text-slate-400">LLM</span>
+                        <span class="text-lg font-bold text-indigo-400" x-text="metrics.resumo_geral.consultas_processadas_llm">0</span>
                     </div>
-                    <div class="bg-slate-900/60 border border-slate-800 p-3 rounded-lg text-center">
-                        <span class="block text-xs text-slate-400">Hits Cache</span>
-                        <span class="text-xl font-bold text-emerald-400" x-text="metrics.resumo_geral.consultas_reaproveitadas_cache">0</span>
+                    <div class="bg-slate-900/60 border border-slate-800 p-2.5 rounded-lg text-center">
+                        <span class="block text-[11px] text-slate-400">Cache</span>
+                        <span class="text-lg font-bold text-emerald-400" x-text="metrics.resumo_geral.consultas_reaproveitadas_cache">0</span>
+                    </div>
+                    <div class="bg-slate-900/60 border border-slate-800 p-2.5 rounded-lg text-center">
+                        <span class="block text-[11px] text-slate-400">MCP</span>
+                        <span class="text-lg font-bold text-cyan-400" x-text="metrics.resumo_geral.consultas_mcp">0</span>
                     </div>
                 </div>
 
@@ -134,7 +139,7 @@
                 pergunta: '',
                 loading: false,
                 mensagens: [
-                    { id: 1, role: 'assistant', text: 'Olá! Sou o assistente de infraestrutura protegido por Guardrails. Como posso ajudar?', source: null, tempo: null }
+                    { id: 1, role: 'assistant', text: 'Olá! Sou o assistente de infraestrutura protegido por Guardrails & MCP. Como posso ajudar?', source: null, tempo: null }
                 ],
                 scrollToBottom() {
                     this.$nextTick(() => {
@@ -191,7 +196,7 @@
         function metricsData() {
             return {
                 metrics: {
-                    resumo_geral: { total_registros_laboratorio: 0, consultas_processadas_llm: 0, consultas_reaproveitadas_cache: 0, tempo_medio_execucao_segundos: 0 }
+                    resumo_geral: { total_registros_laboratorio: 0, consultas_processadas_llm: 0, consultas_reaproveitadas_cache: 0, consultas_mcp: 0, tempo_medio_execucao_segundos: 0 }
                 },
                 async fetchMetrics() {
                     try {

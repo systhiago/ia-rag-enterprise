@@ -1,0 +1,1076 @@
+import os
+import time
+import json
+import re
+import unicodedata
+from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+
+import numpy as np
+import redis
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from langchain_ollama import OllamaLLM, OllamaEmbeddings
+from langchain_community.vectorstores import Redis as RedisVectorStore
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_text_splitters import CharacterTextSplitter
+from langchain_core.documents import Document
+
+
+app = FastAPI(
+    title="API LangChain Local com RAG, MCP e Cache Semântico"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# Configurações
+# ============================================================
+
+OLLAMA_URL = os.getenv(
+    "OLLAMA_BASE_URL",
+    "http://ollama:11434"
+)
+
+REDIS_URL = os.getenv(
+    "REDIS_URL",
+    "redis://redis:6379"
+)
+
+MCP_SERVER_URL = os.getenv(
+    "MCP_SERVER_URL",
+    "http://mcp-server:3000"
+).rstrip("/")
+
+MCP_METRICS_ENDPOINT = os.getenv(
+    "MCP_METRICS_ENDPOINT",
+    "/metrics"
+)
+
+MCP_TIMEOUT_SECONDS = float(
+    os.getenv("MCP_TIMEOUT_SECONDS", "5")
+)
+
+# Cache curto porque CPU e RAM mudam constantemente.
+MCP_CACHE_TTL_SECONDS = int(
+    os.getenv("MCP_CACHE_TTL_SECONDS", "86400")
+)
+
+# Cache normal para respostas RAG/LLM.
+RAG_CACHE_TTL_SECONDS = int(
+    os.getenv("RAG_CACHE_TTL_SECONDS", "86400")
+)
+
+SEMANTIC_CACHE_THRESHOLD = float(
+    os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.65")
+)
+
+
+# ============================================================
+# Clientes
+# ============================================================
+
+llm = OllamaLLM(
+    base_url=OLLAMA_URL,
+    model="llama3.1"
+)
+
+embeddings = OllamaEmbeddings(
+    base_url=OLLAMA_URL,
+    model="nomic-embed-text"
+)
+
+redis_client = redis.Redis.from_url(
+    REDIS_URL,
+    decode_responses=True
+)
+
+global_vectorstore = None
+
+
+# ============================================================
+# Modelos
+# ============================================================
+
+class QueryRequest(BaseModel):
+    question: str
+    manual_prompt: str | None = None
+
+
+# ============================================================
+# Funções auxiliares
+# ============================================================
+
+def normalizar_texto(texto: str) -> str:
+    texto = texto.lower().strip()
+
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(
+        caractere
+        for caractere in texto
+        if not unicodedata.combining(caractere)
+    )
+
+    texto = re.sub(r"[^a-z0-9\s]", " ", texto)
+    texto = re.sub(r"\s+", " ", texto)
+
+    return texto.strip()
+
+
+def cosine_similarity(a, b) -> float:
+    vetor_a = np.asarray(a, dtype=float)
+    vetor_b = np.asarray(b, dtype=float)
+
+    norma_a = np.linalg.norm(vetor_a)
+    norma_b = np.linalg.norm(vetor_b)
+
+    if norma_a == 0 or norma_b == 0:
+        return 0.0
+
+    return float(
+        np.dot(vetor_a, vetor_b) / (norma_a * norma_b)
+    )
+
+
+def registrar_metrica(
+    source: str,
+    metric_type: str,
+    question: str,
+    context_used: str,
+    header_size_bytes: int,
+    execution_time_seconds: float,
+    similarity_score: float | None = None,
+    extra: dict | None = None
+):
+    metric_entry = {
+        "source": source,
+        "type": metric_type,
+        "question": question,
+        "context_used": context_used,
+        "header_size_bytes": header_size_bytes,
+        "execution_time_seconds": execution_time_seconds,
+        "timestamp": time.time()
+    }
+
+    if similarity_score is not None:
+        metric_entry["similarity_score"] = round(
+            float(similarity_score),
+            4
+        )
+
+    if extra:
+        metric_entry.update(extra)
+
+    redis_client.rpush(
+        "lab_metrics",
+        json.dumps(metric_entry, ensure_ascii=False)
+    )
+
+
+# ============================================================
+# Detecção de perguntas relacionadas ao MCP
+# ============================================================
+
+MCP_KEYWORDS = {
+    "cpu",
+    "processador",
+    "carga",
+    "load",
+    "ram",
+    "memoria",
+    "memory",
+    "gpu",
+    "placa de video",
+    "video",
+    "recurso",
+    "recursos",
+    "uso da maquina",
+    "uso do computador",
+    "uso do ubuntu",
+    "status da maquina",
+    "status do computador",
+    "status do ubuntu",
+    "desempenho da maquina",
+    "desempenho do computador",
+    "telemetria"
+}
+
+
+def consulta_requer_mcp(pergunta: str) -> bool:
+    pergunta_normalizada = normalizar_texto(pergunta)
+
+    return any(
+        palavra in pergunta_normalizada
+        for palavra in MCP_KEYWORDS
+    )
+
+
+# ============================================================
+# MCP Server
+# ============================================================
+
+def consultar_mcp_metrics() -> dict:
+    url = f"{MCP_SERVER_URL}{MCP_METRICS_ENDPOINT}"
+
+    try:
+        with urlopen(
+            url,
+            timeout=MCP_TIMEOUT_SECONDS
+        ) as response:
+            status_code = response.getcode()
+            conteudo = response.read().decode("utf-8")
+
+        if status_code != 200:
+            raise RuntimeError(
+                f"MCP retornou HTTP {status_code}"
+            )
+
+        dados = json.loads(conteudo)
+
+        if dados.get("status") != "online":
+            raise RuntimeError(
+                f"MCP não está online: {dados.get('status')}"
+            )
+
+        return dados
+
+    except HTTPError as erro:
+        raise RuntimeError(
+            f"Erro HTTP ao consultar MCP: {erro.code}"
+        ) from erro
+
+    except URLError as erro:
+        raise RuntimeError(
+            f"Falha de conexão com o MCP: {erro.reason}"
+        ) from erro
+
+    except json.JSONDecodeError as erro:
+        raise RuntimeError(
+            "O MCP retornou um JSON inválido."
+        ) from erro
+
+
+def montar_resposta_mcp(dados: dict, pergunta: str) -> str:
+    cpu_load = dados.get("cpu_load", "não informado")
+    memory_total = dados.get("memory_total_gb")
+    memory_used = dados.get("memory_used_gb")
+    gpu_info = dados.get("gpu_info", [])
+    timestamp = dados.get("timestamp")
+
+    linhas = []
+
+    pergunta_normalizada = normalizar_texto(pergunta)
+
+    quer_cpu = any(
+        termo in pergunta_normalizada
+        for termo in [
+            "cpu",
+            "processador",
+            "carga",
+            "load"
+        ]
+    )
+
+    quer_memoria = any(
+        termo in pergunta_normalizada
+        for termo in [
+            "ram",
+            "memoria",
+            "memory"
+        ]
+    )
+
+    quer_gpu = any(
+        termo in pergunta_normalizada
+        for termo in [
+            "gpu",
+            "placa de video",
+            "video"
+        ]
+    )
+
+    consulta_geral = not (
+        quer_cpu or
+        quer_memoria or
+        quer_gpu
+    )
+
+    if quer_cpu or consulta_geral:
+        linhas.append(
+            f"Uso atual de CPU: {cpu_load}"
+        )
+
+    if quer_memoria or consulta_geral:
+        if memory_total is not None and memory_used is not None:
+            total = float(memory_total)
+            usada = float(memory_used)
+            disponivel = max(total - usada, 0.0)
+
+            percentual = (
+                (usada / total) * 100
+                if total > 0
+                else 0
+            )
+
+            linhas.append(
+                f"Memória RAM utilizada: {usada:.2f} GB"
+            )
+            linhas.append(
+                f"Memória RAM total: {total:.2f} GB"
+            )
+            linhas.append(
+                f"Memória RAM disponível: "
+                f"{disponivel:.2f} GB"
+            )
+            linhas.append(
+                f"Percentual de RAM em uso: "
+                f"{percentual:.2f}%"
+            )
+        else:
+            linhas.append(
+                "O MCP não informou os dados de memória RAM."
+            )
+
+    if quer_gpu or consulta_geral:
+        if gpu_info:
+            linhas.append(
+                "Informações de GPU: "
+                + json.dumps(
+                    gpu_info,
+                    ensure_ascii=False
+                )
+            )
+        else:
+            linhas.append(
+                "GPU: nenhuma informação disponível."
+            )
+
+    if timestamp:
+        linhas.append(
+            f"Timestamp informado pelo MCP: {timestamp}"
+        )
+
+    return "\n".join(linhas)
+
+
+# ============================================================
+# Cache semântico
+# ============================================================
+
+def buscar_cache_semantico(
+    pergunta_atual: str,
+    categoria: str,
+    threshold: float = SEMANTIC_CACHE_THRESHOLD
+):
+    try:
+        vetor_atual = embeddings.embed_query(
+            pergunta_atual
+        )
+
+        padrao = f"sem_cache:{categoria}:*"
+        chaves = redis_client.scan_iter(
+            match=padrao,
+            count=100
+        )
+
+        melhor_similaridade = 0.0
+        resposta_encontrada = None
+        chave_encontrada = None
+
+        for chave in chaves:
+            dados_raw = redis_client.get(chave)
+
+            if not dados_raw:
+                continue
+
+            try:
+                dados = json.loads(dados_raw)
+                vetor_salvo = dados.get("embedding")
+                resposta_salva = dados.get("resposta")
+
+                if not vetor_salvo or not resposta_salva:
+                    continue
+
+                similaridade = cosine_similarity(
+                    vetor_atual,
+                    vetor_salvo
+                )
+
+                if similaridade > melhor_similaridade:
+                    melhor_similaridade = similaridade
+                    resposta_encontrada = resposta_salva
+                    chave_encontrada = chave
+
+            except (
+                json.JSONDecodeError,
+                TypeError,
+                ValueError
+            ) as erro:
+                print(
+                    f"AVISO: Cache inválido na chave "
+                    f"{chave}: {erro}"
+                )
+
+        if (
+            resposta_encontrada is not None
+            and melhor_similaridade >= threshold
+        ):
+            return (
+                resposta_encontrada,
+                melhor_similaridade,
+                chave_encontrada
+            )
+
+    except Exception as erro:
+        print(
+            f"Erro ao consultar cache semântico "
+            f"da categoria {categoria}: {erro}"
+        )
+
+    return None, 0.0, None
+
+
+def salvar_cache_semantico(
+    pergunta: str,
+    resposta: str,
+    categoria: str,
+    ttl_seconds: int,
+    metadata: dict | None = None
+):
+    vetor_pergunta = embeddings.embed_query(pergunta)
+
+    cache_payload = {
+        "categoria": categoria,
+        "pergunta_original": pergunta,
+        "embedding": vetor_pergunta,
+        "resposta": resposta,
+        "created_at": time.time(),
+        "metadata": metadata or {}
+    }
+
+    chave = (
+        f"sem_cache:{categoria}:"
+        f"{int(time.time() * 1000)}"
+    )
+
+    redis_client.setex(
+        chave,
+        ttl_seconds,
+        json.dumps(
+            cache_payload,
+            ensure_ascii=False
+        )
+    )
+
+    return chave
+
+
+# ============================================================
+# Vetores RAG
+# ============================================================
+
+def carregar_vetores():
+    global global_vectorstore
+
+    docs_path = "/app/docs"
+
+    if not os.path.exists(docs_path):
+        docs_path = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "docs"
+            )
+        )
+
+    print(
+        f"DEBUG: Procurando documentos em: {docs_path}"
+    )
+
+    if not os.path.exists(docs_path):
+        print(
+            f"AVISO: Diretório não encontrado: {docs_path}"
+        )
+        return False
+
+    try:
+        documents = []
+
+        for root, _, files in os.walk(docs_path):
+            for file in files:
+                if not file.endswith(".md"):
+                    continue
+
+                file_path = os.path.join(root, file)
+
+                with open(
+                    file_path,
+                    "r",
+                    encoding="utf-8"
+                ) as arquivo:
+                    content = arquivo.read()
+
+                documents.append(
+                    Document(
+                        page_content=content,
+                        metadata={
+                            "source": file_path
+                        }
+                    )
+                )
+
+        print(
+            "DEBUG: Total de documentos .md "
+            f"carregados: {len(documents)}"
+        )
+
+        if not documents:
+            print(
+                "AVISO: Nenhum arquivo .md "
+                "encontrado na pasta docs."
+            )
+            return False
+
+        text_splitter = CharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50
+        )
+
+        docs = text_splitter.split_documents(
+            documents
+        )
+
+        global_vectorstore = (
+            RedisVectorStore.from_documents(
+                docs,
+                embeddings,
+                redis_url=REDIS_URL,
+                index_name="rag_docs"
+            )
+        )
+
+        print(
+            "SUCESSO: Documentos indexados "
+            "no Redis Vector Store!"
+        )
+
+        return True
+
+    except Exception as erro:
+        print(
+            f"ERRO na indexação automática: {erro}"
+        )
+        return False
+
+
+# ============================================================
+# Inicialização
+# ============================================================
+
+@app.on_event("startup")
+def startup_event():
+    try:
+        redis_client.ping()
+        print("SUCESSO: Redis conectado.")
+    except Exception as erro:
+        print(f"ERRO ao conectar no Redis: {erro}")
+
+    carregar_vetores()
+
+
+# ============================================================
+# Endpoints auxiliares
+# ============================================================
+
+@app.get("/health")
+def health():
+    resultado = {
+        "api": "online",
+        "redis": "offline",
+        "mcp": "offline",
+        "vectorstore_ativo": (
+            global_vectorstore is not None
+        )
+    }
+
+    try:
+        redis_client.ping()
+        resultado["redis"] = "online"
+    except Exception as erro:
+        resultado["redis_error"] = str(erro)
+
+    try:
+        dados_mcp = consultar_mcp_metrics()
+        resultado["mcp"] = dados_mcp.get(
+            "status",
+            "online"
+        )
+    except Exception as erro:
+        resultado["mcp_error"] = str(erro)
+
+    return resultado
+
+
+@app.get("/mcp/metrics")
+def obter_metricas_mcp():
+    try:
+        return consultar_mcp_metrics()
+    except Exception as erro:
+        raise HTTPException(
+            status_code=503,
+            detail=str(erro)
+        )
+
+
+@app.post("/reindexar")
+def reindexar():
+    sucesso = carregar_vetores()
+
+    return {
+        "status": (
+            "sucesso"
+            if sucesso
+            else "falha"
+        ),
+        "vectorstore_ativo": (
+            global_vectorstore is not None
+        )
+    }
+
+
+# ============================================================
+# Endpoint principal
+# ============================================================
+
+@app.post("/perguntar")
+def perguntar(
+    req: QueryRequest,
+    request: Request
+):
+    start_time = time.time()
+
+    pergunta = req.question.strip()
+
+    if not pergunta:
+        raise HTTPException(
+            status_code=400,
+            detail="A pergunta não pode ficar vazia."
+        )
+
+    query_text = (
+        req.manual_prompt.strip()
+        if req.manual_prompt
+        else pergunta
+    )
+
+    headers_dict = dict(request.headers)
+
+    header_size_bytes = sum(
+        len(str(chave)) + len(str(valor))
+        for chave, valor in headers_dict.items()
+    )
+
+    # ========================================================
+    # Fluxo MCP
+    # ========================================================
+
+    if consulta_requer_mcp(pergunta):
+        categoria = "mcp"
+
+        resposta_cache, similaridade, chave_cache = (
+            buscar_cache_semantico(
+                pergunta_atual=pergunta,
+                categoria=categoria
+            )
+        )
+
+        if resposta_cache:
+            elapsed_time = round(
+                time.time() - start_time,
+                4
+            )
+
+            source = "cache_semantico_redis_mcp"
+
+            registrar_metrica(
+                source=source,
+                metric_type="mcp_query_cache",
+                question=pergunta,
+                context_used=query_text,
+                header_size_bytes=header_size_bytes,
+                execution_time_seconds=elapsed_time,
+                similarity_score=similaridade,
+                extra={
+                    "cache_key": chave_cache,
+                    "cache_ttl_seconds": (
+                        MCP_CACHE_TTL_SECONDS
+                    )
+                }
+            )
+
+            return {
+                "source": source,
+                "similarity_score": round(
+                    float(similaridade),
+                    4
+                ),
+                "execution_time_seconds": elapsed_time,
+                "header_size_bytes": header_size_bytes,
+                "answer": resposta_cache
+            }
+
+        try:
+            dados_mcp = consultar_mcp_metrics()
+
+            resposta = montar_resposta_mcp(
+                dados=dados_mcp,
+                pergunta=pergunta
+            )
+
+            chave_cache = salvar_cache_semantico(
+                pergunta=pergunta,
+                resposta=resposta,
+                categoria=categoria,
+                ttl_seconds=MCP_CACHE_TTL_SECONDS,
+                metadata={
+                    "mcp_timestamp": dados_mcp.get(
+                        "timestamp"
+                    )
+                }
+            )
+
+            elapsed_time = round(
+                time.time() - start_time,
+                4
+            )
+
+            source = "mcp_server"
+
+            registrar_metrica(
+                source=source,
+                metric_type="mcp_query_live",
+                question=pergunta,
+                context_used=json.dumps(
+                    dados_mcp,
+                    ensure_ascii=False
+                ),
+                header_size_bytes=header_size_bytes,
+                execution_time_seconds=elapsed_time,
+                extra={
+                    "cache_key": chave_cache,
+                    "mcp_timestamp": dados_mcp.get(
+                        "timestamp"
+                    )
+                }
+            )
+
+            return {
+                "source": source,
+                "execution_time_seconds": elapsed_time,
+                "header_size_bytes": header_size_bytes,
+                "mcp_timestamp": dados_mcp.get(
+                    "timestamp"
+                ),
+                "answer": resposta
+            }
+
+        except Exception as erro_mcp:
+            print(
+                f"ERRO: Falha ao consultar MCP: "
+                f"{erro_mcp}"
+            )
+
+            elapsed_time = round(
+                time.time() - start_time,
+                4
+            )
+
+            registrar_metrica(
+                source="mcp_error",
+                metric_type="mcp_query_error",
+                question=pergunta,
+                context_used=query_text,
+                header_size_bytes=header_size_bytes,
+                execution_time_seconds=elapsed_time,
+                extra={
+                    "error": str(erro_mcp)
+                }
+            )
+
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Não foi possível consultar os dados "
+                    f"atuais da máquina no MCP: {erro_mcp}"
+                )
+            )
+
+    # ========================================================
+    # Fluxo RAG / LLM
+    # ========================================================
+
+    categoria = "rag"
+
+    resposta_cache, similaridade, chave_cache = (
+        buscar_cache_semantico(
+            pergunta_atual=pergunta,
+            categoria=categoria
+        )
+    )
+
+    if resposta_cache:
+        elapsed_time = round(
+            time.time() - start_time,
+            4
+        )
+
+        source = "cache_semantico_redis"
+
+        registrar_metrica(
+            source=source,
+            metric_type="rag_query_cache",
+            question=pergunta,
+            context_used=query_text,
+            header_size_bytes=header_size_bytes,
+            execution_time_seconds=elapsed_time,
+            similarity_score=similaridade,
+            extra={
+                "cache_key": chave_cache
+            }
+        )
+
+        return {
+            "source": source,
+            "similarity_score": round(
+                float(similaridade),
+                4
+            ),
+            "execution_time_seconds": elapsed_time,
+            "header_size_bytes": header_size_bytes,
+            "answer": resposta_cache
+        }
+
+    try:
+        global global_vectorstore
+
+        if global_vectorstore is None:
+            raise RuntimeError(
+                "Vectorstore não inicializado."
+            )
+
+        retriever = global_vectorstore.as_retriever(
+            search_kwargs={"k": 3}
+        )
+
+        template = (
+            "Responda à pergunta detalhadamente com base "
+            "estritamente no contexto abaixo.\n\n"
+            "Contexto:\n{context}\n\n"
+            "Pergunta:\n{question}"
+        )
+
+        prompt = ChatPromptTemplate.from_template(
+            template
+        )
+
+        chain = (
+            {
+                "context": retriever
+                | (
+                    lambda docs: "\n\n".join(
+                        documento.page_content
+                        for documento in docs
+                    )
+                    if docs
+                    else "Nenhum contexto encontrado."
+                ),
+                "question": RunnablePassthrough()
+            }
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+
+        response = chain.invoke(query_text)
+
+        elapsed_time = round(
+            time.time() - start_time,
+            4
+        )
+
+        source = "llm_generated_rag"
+
+        chave_cache = salvar_cache_semantico(
+            pergunta=pergunta,
+            resposta=response,
+            categoria=categoria,
+            ttl_seconds=RAG_CACHE_TTL_SECONDS
+        )
+
+        registrar_metrica(
+            source=source,
+            metric_type="rag_query",
+            question=pergunta,
+            context_used=query_text,
+            header_size_bytes=header_size_bytes,
+            execution_time_seconds=elapsed_time,
+            extra={
+                "cache_key": chave_cache
+            }
+        )
+
+        return {
+            "source": source,
+            "execution_time_seconds": elapsed_time,
+            "header_size_bytes": header_size_bytes,
+            "answer": response
+        }
+
+    except Exception as erro_rag:
+        print(
+            "RAG falhou. Usando fallback direto: "
+            f"{erro_rag}"
+        )
+
+        try:
+            response = llm.invoke(query_text)
+
+            elapsed_time = round(
+                time.time() - start_time,
+                4
+            )
+
+            source = "llm_fallback"
+
+            chave_cache = salvar_cache_semantico(
+                pergunta=pergunta,
+                resposta=response,
+                categoria=categoria,
+                ttl_seconds=RAG_CACHE_TTL_SECONDS
+            )
+
+            registrar_metrica(
+                source=source,
+                metric_type="rag_query_fallback",
+                question=pergunta,
+                context_used=query_text,
+                header_size_bytes=header_size_bytes,
+                execution_time_seconds=elapsed_time,
+                extra={
+                    "cache_key": chave_cache,
+                    "rag_error": str(erro_rag)
+                }
+            )
+
+            return {
+                "source": source,
+                "execution_time_seconds": elapsed_time,
+                "header_size_bytes": header_size_bytes,
+                "answer": response
+            }
+
+        except Exception as erro_llm:
+            raise HTTPException(
+                status_code=500,
+                detail=str(erro_llm)
+            )
+
+
+# ============================================================
+# Métricas do laboratório
+# ============================================================
+
+@app.get("/metricas-laboratorio")
+def obter_metricas():
+    raw_metrics = redis_client.lrange(
+        "lab_metrics",
+        0,
+        -1
+    )
+
+    metrics = []
+
+    for item in raw_metrics:
+        try:
+            metrics.append(json.loads(item))
+        except json.JSONDecodeError:
+            print(
+                "AVISO: Registro inválido encontrado "
+                "em lab_metrics."
+            )
+
+    total_consultas = len(metrics)
+
+    total_llm = sum(
+        1
+        for metrica in metrics
+        if "llm" in metrica.get("source", "")
+    )
+
+    total_cache = sum(
+        1
+        for metrica in metrics
+        if "cache" in metrica.get("source", "")
+    )
+
+    total_mcp_live = sum(
+        1
+        for metrica in metrics
+        if metrica.get("source") == "mcp_server"
+    )
+
+    total_mcp_cache = sum(
+        1
+        for metrica in metrics
+        if metrica.get("source")
+        == "cache_semantico_redis_mcp"
+    )
+
+    tempo_medio = (
+        sum(
+            float(
+                metrica.get(
+                    "execution_time_seconds",
+                    0
+                )
+            )
+            for metrica in metrics
+        ) / total_consultas
+        if total_consultas > 0
+        else 0
+    )
+
+    return {
+        "resumo_geral": {
+            "total_registros_laboratorio": (
+                total_consultas
+            ),
+            "consultas_processadas_llm": total_llm,
+            "consultas_reaproveitadas_cache": (
+                total_cache
+            ),
+            "consultas_mcp_tempo_real": (
+                total_mcp_live
+            ),
+            "consultas_mcp_reaproveitadas_cache": (
+                total_mcp_cache
+            ),
+            "tempo_medio_execucao_segundos": round(
+                tempo_medio,
+                4
+            )
+        },
+        "detalhado_por_requisicao": metrics
+    }

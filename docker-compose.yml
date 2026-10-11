@@ -10,7 +10,12 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull nomic-embed-text && ollama pull llama3.1 && echo 'Modelos baixados com sucesso!' && wait"]
+    entrypoint:
+      [
+        "/bin/sh",
+        "-c",
+        "ollama serve & sleep 5 && ollama pull nomic-embed-text && ollama pull llama3.1 && echo 'Modelos baixados com sucesso!' && wait"
+      ]
     restart: unless-stopped
 
   redis:
@@ -34,16 +39,30 @@ services:
     ports:
       - "8000:8000"
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
       - REDIS_URL=redis://redis:6379
+
+      - MCP_SERVER_URL=http://mcp-server:3000
+      - MCP_METRICS_ENDPOINT=/metrics
+      - MCP_TIMEOUT_SECONDS=5
+
+      - RAG_CACHE_TTL_SECONDS=86400
+      - POLICY_CACHE_TTL_SECONDS=86400
+
+      - SEMANTIC_CACHE_THRESHOLD=0.78
+
     volumes:
       - .:/app
+
     working_dir: /app/api
+
     depends_on:
       - ollama
       - redis
       - mcp-server
+
     restart: unless-stopped
 
   rag-dashboard:
